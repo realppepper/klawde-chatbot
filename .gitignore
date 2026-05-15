@@ -1,0 +1,19 @@
+# API 키 / 시크릿 (절대 올리면 안 됨)
+.streamlit/api.toml
+
+# 로컬 DB / 벡터 DB (용량 크고 재생성 가능)
+chroma_db_html/
+chatbot.db
+
+# HTML 크롤링 데이터 (재크롤링 가능)
+html_data/
+
+# Python 캐시
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+
+# IDE
+.vscode/
+.idea/

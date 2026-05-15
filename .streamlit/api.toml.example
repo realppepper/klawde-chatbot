@@ -1,0 +1,4 @@
+# 이 파일을 복사해서 api.toml 로 이름 바꾸고 실제 키를 입력하세요
+# cp .streamlit/api.toml.example .streamlit/api.toml
+
+VOYAGE_API_KEY = "여기에_본인_키_입력"
