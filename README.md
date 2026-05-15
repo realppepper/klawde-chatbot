@@ -54,14 +54,14 @@ cat 서버재업로드.txt | bash
 
 ---
 
-### 4. 벡터 DB 구축
+## 4. 벡터 DB 구축
 ```bash
 python embed.py
 ```
 
 ---
 
-### 5. 앱 실행
+## 5. 앱 실행
 ```bash
 streamlit run 2.py
 ```
