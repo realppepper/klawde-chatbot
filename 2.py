@@ -12,6 +12,12 @@ from datetime import datetime
 import json
 import tempfile
 
+# 기존 2.py의 상단 임포트 혹은 파일 가동부에 선언 추가
+from advanced_rag import AdvancedRAGEngine
+
+# 글로벌 싱글톤 형태로 1회 엔진 인스턴스 구축
+RAG_SYSTEM = AdvancedRAGEngine(rebuild_mode=False)
+
 def _job_path(job_id: str) -> str:
     return os.path.join(tempfile.gettempdir(), f"klawde_{job_id}.json")
 
@@ -559,63 +565,48 @@ def load_vector_db(folder_path: str, rebuild: bool = False):
     return db, None
 
 def _rag_worker(job_id: str, question: str, model_name: str):
-    """백그라운드 스레드 — SDK 우회, 순수 requests + chromadb 직접 사용"""
+    """백그라운드 스레드 — 고도화된 하이브리드 Parent-Child RAG 엔진 탑재 패치 버전"""
     import requests
-    import chromadb
-    import voyageai
+    import json
 
     GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
     HEADERS = {"x-goog-api-key": API_KEY, "Content-Type": "application/json"}
 
     try:
-        # 1. 임베딩 (Voyage API)
-        vo = voyageai.Client(api_key=VOYAGE_API_KEY)
-        query_vec = vo.embed([question], model="voyage-3-lite", input_type="query").embeddings[0]
+        # [패치 핵심]: 기존 VoyageAI 단독 및 크로마 단순 쿼리 제거
+        # 최적화 아키텍처가 결합된 하이브리드 엔진에서 정제된 윈도우 컨텍스트와 출처 소스 직접 호출
+        context, sources = RAG_SYSTEM.hybrid_search(question, top_n=4)
 
-        # 2. ChromaDB 검색 (새 연결 — 스레드 안전)
-        chroma = chromadb.PersistentClient(path=CHROMA_DIR)
-        col = chroma.get_collection("langchain")
-        results = col.query(
-            query_embeddings=[query_vec],
-            n_results=5,
-            include=["documents", "metadatas", "distances"]
-        )
-        docs_texts = results["documents"][0]
-        metadatas = results.get("metadatas", [[]])[0]
-        distances = results.get("distances", [[]])[0]
-        context = "\n\n".join(docs_texts)
-
-        # 3. 답변 생성 (REST API 직접 호출)
+        # 2. 정밀 통합된 지식 기반으로 프롬프트 주입
         full_prompt = (
-            "다음 문서 내용을 참고해서 질문에 답하세요.\n\n"
-            f"문서:\n{context}\n\n질문: {question}"
+            "당신은 광운대학교 학사안내 전문 AI 비서 KlaWde입니다.\n"
+            "아래 제공된 공지사항 및 첨부파일 참조 단락 컨텍스트의 내용을 엄격히 준수하여 사용자의 질문에 신뢰성 있게 답변하세요.\n"
+            "제공된 텍스트 내용으로 유추할 수 없거나 확답이 불가능한 질문은 억지로 답변하지 말고 포털 주소나 담당 부서 안내 유도를 수행하세요.\n\n"
+            f"[참조 컨텍스트 지식 스토어]:\n{context}\n\n"
+            f"[사용자 질의 요구사항]: {question}"
         )
+        
+        # 3. LLM 생성 호출 부
         r2 = requests.post(
             f"{GEMINI_BASE}/{model_name}:generateContent",
             headers=HEADERS,
             json={
                 "contents": [{"role": "user", "parts": [{"text": full_prompt}]}],
-                "generationConfig": {"temperature": 0.3}
+                "generationConfig": {"temperature": 0.2} # 일관된 정보 제공을 위해 온도 하향 조정
             },
             timeout=120
         )
         r2.raise_for_status()
         answer = r2.json()["candidates"][0]["content"]["parts"][0]["text"]
 
-        # 거리 기준 0.5 이하인 문서만 참고 문서로 표시
-        seen = set()
-        sources = []
-        for m, d in zip(metadatas, distances):
-            if m and m.get("source") and d < 0.5:
-                name = os.path.basename(m["source"])
-                if name not in seen:
-                    seen.add(name)
-                    sources.append(name)
+        # 출처 리포팅 바인딩 (RRF 앙상블 가중치 결과 반영)
         if sources:
-            answer += "\n\n📎 **참고 문서**\n" + "\n".join(f"- {s}" for s in sources)
+            answer += "\n\n📎 **KlaWde RAG 분석 기반 시스템 참조 출처**\n" + "\n".join(f"- {s}" for s in sources)
 
+        # 스레드 결과 전송 세팅
         with open(_job_path(job_id), "w", encoding="utf-8") as f:
             json.dump({"done": True, "result": answer}, f, ensure_ascii=False)
+            
     except Exception as e:
         with open(_job_path(job_id), "w", encoding="utf-8") as f:
             json.dump({"done": True, "error": str(e)}, f, ensure_ascii=False)
