@@ -18,8 +18,10 @@ with open(".streamlit/api.toml", "rb") as f:
     _secrets = tomllib.load(f)
 VOYAGE_API_KEY = _secrets["VOYAGE_API_KEY"]
 
-HTML_BASE = "./html_data"
-CHROMA_DIR = "./chroma_db_html"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+HTML_BASE = os.path.join(BASE_DIR, "data/html_data")
+CHROMA_DIR = os.path.join(BASE_DIR, "data/chroma_db_html")
 BM25_PKL_PATH = os.path.join(CHROMA_DIR, "bm25_docs.pkl")
 
 # 최적화 임계치 세팅
