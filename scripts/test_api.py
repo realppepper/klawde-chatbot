@@ -1,36 +1,44 @@
+# scripts/test_api.py (기존 파일 덮어쓰기)
+import sys
+import os
+import requests
 import tomllib
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from langchain_core.messages import HumanMessage
+import voyageai
+
+# 프로젝트 루트 경로 추가
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 with open(".streamlit/api.toml", "rb") as f:
     secrets = tomllib.load(f)
-API_KEY = secrets["GEMINI_API_KEY"]
 
-print(f"API 키 확인: {API_KEY[:8]}...")
+GROQ_API_KEY = secrets.get("GROQ_API_KEY", "")
+VOYAGE_API_KEY = secrets.get("VOYAGE_API_KEY", "")
 
-# 1. 임베딩 테스트
-print("\n[1] 임베딩 API 테스트 중...")
+print("=== [1단계] API 통신 및 토큰 한도 진단 ===")
+
+# 1. VoyageAI Reranker 테스트
+print("\n[1] VoyageAI Reranker API 테스트 중...")
 try:
-    embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/gemini-embedding-001",
-        google_api_key=API_KEY
-    )
-    vec = embeddings.embed_query("테스트 문장입니다")
-    print(f"    성공! 벡터 길이: {len(vec)}")
+    vo = voyageai.Client(api_key=VOYAGE_API_KEY)
+    res = vo.rerank(query="테스트", documents=["테스트 문서입니다."], model="rerank-2", top_k=1)
+    print(f"  ✅ 성공! Reranker 연결 정상 (Score: {res.results[0].relevance_score:.4f})")
 except Exception as e:
-    print(f"    실패: {e}")
+    print(f"  ❌ 실패: {e}")
 
-# 2. 채팅 모델 테스트
-print("\n[2] 채팅 API 테스트 중...")
+# 2. Groq LLM 테스트
+print("\n[2] Groq LLM API 테스트 중...")
 try:
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.0-flash",
-        google_api_key=API_KEY,
-        temperature=0
-    )
-    resp = llm.invoke([HumanMessage(content="안녕")])
-    print(f"    성공! 응답: {resp.content[:50]}")
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": "llama-3.1-8b-instant",
+        "messages": [{"role": "user", "content": "안녕, 딱 10글자로 대답해줘."}],
+        "max_tokens": 50
+    }
+    response = requests.post(url, headers=headers, json=payload, timeout=10)
+    response.raise_for_status()
+    print(f"  ✅ 성공! 응답: {response.json()['choices'][0]['message']['content']}")
 except Exception as e:
-    print(f"    실패: {e}")
+    print(f"  ❌ 실패: {e}")
 
-print("\n테스트 완료")
+print("\n진단 완료.")
