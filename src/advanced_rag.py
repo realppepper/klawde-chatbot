@@ -1,3 +1,4 @@
+# src/advanced_rag.py
 import os
 import sys
 import json
@@ -85,6 +86,33 @@ class AdvancedRAGEngine:
             logger.critical(f"[Engine Init 치명적 에러] {str(e)}\n{traceback.format_exc()}")
             raise e
 
+    def extract_keywords_for_bm25(self, query_text: str) -> str:
+        """
+        [지속 가능한 핵심 해결책]: 시간 명사(2026년, 1학기)를 임의로 지우지 않고 유지하여 일정 검색력을 보존하되,
+        교수 이름이나 학과명 같은 고유명사(NNP)가 쿼리에서 발견되면 해당 단어의 가중치를 3배로 증폭(Query Boosting)시킵니다.
+        """
+        try:
+            analysis = kiwi.tokenize(query_text)
+            
+            # 고유명사(NNP) 타겟 추출 (예: 최영석, 박수원 등)
+            nnps = [token.form for token in analysis if token.tag == 'NNP']
+            
+            # 본문에 너무 흔하게 혼재되어 가중치를 해치는 순수 안내성 불용어만 필터링
+            stop_keywords = {'확인', '안내', '정보', '내용', '대해', '관련', '무엇', '어떤'}
+            
+            words = [token.form for token in analysis if token.tag.startswith('N') or token.tag == 'SN']
+            filtered_words = [w for w in words if w not in stop_keywords]
+            
+            # 고유명사 매칭 구조 가중치 인위적 부스팅 처리 (TF 비중 향상 효과)
+            if nnps:
+                boosted_nnps = nnps * 3
+                final_query = boosted_nnps + [w for w in filtered_words if w not in nnps]
+                return " ".join(final_query)
+                
+            return " ".join(filtered_words) if filtered_words else query_text
+        except Exception:
+            return query_text
+
     def build_index(self, folder_path=HTML_BASE, skip_chroma=False):
         logger.info(f"[Engine Build] 인덱스 빌드 가동 (skip_chroma={skip_chroma})")
         try:
@@ -164,15 +192,18 @@ class AdvancedRAGEngine:
             return "엔진 상태가 비정상입니다.", []
 
         try:
+            # 📌 부스팅 최적화 가중치 전처리가 반영된 extract_keywords_for_bm25 메서드 호출
+            bm25_query = self.extract_keywords_for_bm25(query)
+            logger.info(f"[Engine Search] 부스팅 처리 후 변환된 BM25 매칭용 실시간 쿼리: '{bm25_query}'")
+            
             self.bm25_retriever.k = 20
+            bm25_results = self.bm25_retriever.invoke(bm25_query)
             vector_results = self.vector_db.similarity_search(query, k=20)
-            bm25_results = self.bm25_retriever.invoke(query)
 
             unique_chunks_dict = {c.metadata.get("parent_id", "none") + "_" + c.page_content: c for c in (vector_results + bm25_results)}
             unique_chunks = list(unique_chunks_dict.values())
             documents_texts = [c.page_content for c in unique_chunks]
 
-            # [핵심 교정] 지원되지 않는 'voyage-rerank-2' 모델명을 공식 규격인 'rerank-2'로 변경
             try:
                 rerank_results = self.voyage_client.rerank(
                     query=query, 
@@ -181,7 +212,6 @@ class AdvancedRAGEngine:
                     top_k=min(top_n * 3, len(documents_texts))
                 )
                 
-                # 정상 정렬된 인덱스 바인딩 순회
                 fused_parent_contexts = []
                 retrieved_sources = set()
                 seen_parent_ids = set()
@@ -195,7 +225,6 @@ class AdvancedRAGEngine:
                     if len(fused_parent_contexts) >= top_n: break
                     
             except Exception as rerank_err:
-                # [안전 장치] Voyage API 호출간 한도 초과나 기타 네트워크 에러 발생 시, 검색이 통째로 폭파되지 않고 1차 검색 랭킹순으로 안정적으로 폴백되도록 보호
                 logger.error(f"[Rerank API Warning] 리랭킹 연산 실패 (1차 매칭 순으로 폴백 수행): {str(rerank_err)}")
                 fused_parent_contexts = []
                 retrieved_sources = set()

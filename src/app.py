@@ -23,7 +23,6 @@ for key, val in {
     "user": None,
     "current_rag_conv_id": None,
     "show_register": False,
-    "model_type": "Flash", # 원래의 Flash 표기로 롤백
     "rag_ready": True,
     "rag_messages": [],
     "rag_job_id": None,
@@ -61,14 +60,11 @@ if not st.session_state.logged_in:
             new_username = st.text_input("아이디")
             new_password = st.text_input("비밀번호", type="password")
             new_name = st.text_input("이름")
-            new_department = st.text_input("학과")
-            new_gender = st.selectbox("성별", ["선택 안 함", "남성", "여성", "기타"])
-            new_age = st.number_input("나이", min_value=1, max_value=100, value=20)
             if st.button("가입하기", use_container_width=True):
                 if not new_username or not new_password or not new_name:
                     st.error("아이디, 비밀번호, 이름은 필수입니다.")
                 else:
-                    if db.register_user(new_username, new_password, new_name, new_department, new_gender, int(new_age)):
+                    if db.register_user(new_username, new_password, new_name, "", "선택 안 함", 0):
                         st.success("가입 완료! 로그인 해주세요.")
                         st.session_state.show_register = False
                         st.rerun()
@@ -83,29 +79,27 @@ if not st.session_state.logged_in:
 # 메인 어플리케이션 인터랙션 레이어
 # ───────────────────────────────────────────
 user = st.session_state.user
-model_name = "gemini-2.5-flash" if st.session_state.model_type == "Flash" else "gemini-2.5-pro"
+model_name = "gemini-2.5-flash"  # 모델 고정 (Flash)
 
 with st.sidebar:
-    st.markdown(f'<div class="sidebar-username">{user["name"]} 님</div>', unsafe_allow_html=True)
-    if st.button("＋  새 대화", use_container_width=True):
+    st.markdown(f'<div class="sidebar-username">{user["name"]} 님</div><div class="sidebar-subtext">KWU Chatbot</div>', unsafe_allow_html=True)
+    if st.button("＋  새 대화", use_container_width=True, type="primary"):
         st.session_state.current_rag_conv_id = None
         st.session_state.rag_messages = []
         st.rerun()
     st.divider()
     
-    # 모델 선택 사양 원래 규격(Flash / Pro)으로 복구
-    st.session_state.model_type = st.radio("모델", ["Flash", "Pro"], horizontal=True)
-    st.divider()
-
     conversations = db.get_conversations(user["id"])
     if conversations:
         st.markdown('<p style="font-size:0.875rem;font-weight:600;color:var(--text2);font-family:Pretendard,sans-serif;margin:0 0 0.25rem 0;">대화 기록</p>', unsafe_allow_html=True)
         for conv in conversations:
             conv_id, title, created_at = conv
             is_active = st.session_state.current_rag_conv_id == conv_id
+            if is_active:
+                st.markdown('<div class="conv-active">', unsafe_allow_html=True)
             col_a, col_b = st.columns([8, 1])
             with col_a:
-                label = f"· {title}" if is_active else title
+                label = title
                 if st.button(label, key=f"conv_{conv_id}", use_container_width=True):
                     st.session_state.current_rag_conv_id = conv_id
                     st.session_state.rag_messages = db.get_messages(conv_id)
@@ -117,6 +111,8 @@ with st.sidebar:
                         st.session_state.rag_messages = []
                     db.delete_conversation(conv_id)
                     st.rerun()
+            if is_active:
+                st.markdown('</div>', unsafe_allow_html=True)
         st.divider()
         if st.button("전체 삭제", use_container_width=True):
             db.delete_all_conversations(user["id"])
@@ -124,15 +120,65 @@ with st.sidebar:
             st.session_state.rag_messages = []
             st.rerun()
 
-    st.divider()
+    st.markdown('<div class="logout-wrap">', unsafe_allow_html=True)
     if st.button("로그아웃", use_container_width=True):
         st.session_state.update({"logged_in": False, "user": None, "current_rag_conv_id": None, "rag_messages": []})
         st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# 빈 화면 상태 메시지
+if not st.session_state.rag_messages:
+    st.markdown("""
+        <div class="empty-state">
+            <div class="empty-state-logo">KlaWde</div>
+            <div class="empty-state-sub">광운대 공지사항에 대해 무엇이든 물어보세요</div>
+        </div>
+    """, unsafe_allow_html=True)
+    hint_prompts = ["수강신청 일정 알려줘", "장학금 신청 방법이 뭐야?", "등록금 납부 안내 알려줘"]
+    _, center, _ = st.columns([1, 2, 1])
+    with center:
+        for hint in hint_prompts:
+            if st.button(hint, use_container_width=True, key=f"hint_{hint}"):
+                if st.session_state.current_rag_conv_id is None:
+                    title = hint[:20] + "..." if len(hint) > 20 else hint
+                    st.session_state.current_rag_conv_id = db.create_conversation(user["id"], title)
+                memory_window = []
+                st.session_state.rag_messages.append({"role": "user", "content": hint})
+                db.save_message(st.session_state.current_rag_conv_id, "user", hint)
+                job_id = str(uuid.uuid4())
+                st.session_state.update({
+                    "rag_job_id": job_id,
+                    "rag_processing": True,
+                    "rag_job_start": time.time()
+                })
+                t = threading.Thread(target=rw._rag_worker, args=(job_id, hint, model_name, memory_window), daemon=True)
+                t.start()
+                st.rerun()
+
+# 메시지 있을 때 스크롤 하단 고정
+if st.session_state.rag_messages:
+    st.markdown("""
+        <script>
+            (function() {
+                function scrollToBottom() {
+                    var main = window.parent.document.querySelector('section[data-testid="stMain"]');
+                    if (main) main.scrollTop = main.scrollHeight;
+                }
+                scrollToBottom();
+                setTimeout(scrollToBottom, 100);
+                setTimeout(scrollToBottom, 300);
+            })();
+        </script>
+    """, unsafe_allow_html=True)
 
 # 기존 메시지 출력
 for msg in st.session_state.rag_messages:
-    with st.chat_message(msg["role"], avatar="🧑‍💻" if msg["role"] == "user" else "🤖"):
-        st.markdown(msg["content"])
+    if msg["role"] == "user":
+        st.markdown(f'<div class="msg-label msg-label-right">{user["name"]}</div><div class="user-msg">{msg["content"]}</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="msg-label">KlaWde</div>', unsafe_allow_html=True)
+        with st.chat_message("assistant", avatar=None):
+            st.markdown(msg["content"])
 
 # 비동기 폴링 뷰 프래그먼트
 if st.session_state.rag_processing:
@@ -168,7 +214,7 @@ if st.session_state.rag_processing:
         else:
             st.markdown('<div class="kl-spinner-wrap" style="height:40px;"><div class="kl-spinner"></div></div>', unsafe_allow_html=True)
             
-    with st.chat_message("assistant", avatar="🤖"):
+    with st.chat_message("assistant", avatar=None):
         _poll_async_worker()
 
 if st.session_state.get("rag_last_error"):
@@ -177,7 +223,7 @@ if st.session_state.get("rag_last_error"):
 
 # 입력창 제어 (질의 전송 핸들러)
 if not st.session_state.rag_processing:
-    if prompt := st.chat_input("문서에 대해 질문하세요"):
+    if prompt := st.chat_input("질문을 입력해 주세요..."):
         if st.session_state.current_rag_conv_id is None:
             title = prompt[:20] + "..." if len(prompt) > 20 else prompt
             st.session_state.current_rag_conv_id = db.create_conversation(user["id"], title)

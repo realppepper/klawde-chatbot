@@ -11,7 +11,7 @@ from datetime import datetime
 from advanced_rag import AdvancedRAGEngine
 
 # ───────────────────────────────────────────
-# 로그 시스템 세팅
+# 로그 시스템 및 디렉토리 세팅
 # ───────────────────────────────────────────
 logger = logging.getLogger("KlawdeLogger")
 if not logger.handlers:
@@ -23,6 +23,9 @@ if not logger.handlers:
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(file_formatter)
     logger.addHandler(stream_handler)
+
+# 수집 문서 무생략 저장을 위한 logs 폴더 보장
+os.makedirs("logs", exist_ok=True)
 
 _RAG_SYSTEM_INSTANCE = None
 
@@ -48,23 +51,68 @@ except Exception as e:
 def get_job_path(job_id: str) -> str:
     return os.path.join(tempfile.gettempdir(), f"klawde_{job_id}.json")
 
+def save_ui_retrieved_documents(raw_question, optimized_query, bm25_docs, vector_docs):
+    """
+    [요구사항 반영]: UI에서 사용자가 입력한 질문과 하이브리드 검색엔진이 수집한 
+    모든 문서의 원문 본문 전체를 생략 없이 고유 텍스트 파일로 안전하게 백업합니다.
+    """
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # 파일명 안정성 검크 및 슬라이싱
+        clean_q = "".join([c for c in raw_question if c.isalnum() or c in (' ', '_', '-')]).strip()[:25]
+        clean_q = clean_q.replace(' ', '_')
+        if not clean_q:
+            clean_q = "ui_query"
+            
+        filename = f"logs/ui_retrieved_docs_{timestamp}_{clean_q}.txt"
+        
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write("==================================================================\n")
+            f.write("📱 KlaWde Web UI 실시간 수집 문서 원문 백업 로그\n")
+            f.write(f"📅 일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"🧑‍💻 사용자 원본 질문: {raw_question}\n")
+            f.write(f"🔄 최적화 정제 쿼리: {optimized_query}\n")
+            f.write("==================================================================\n\n")
+            
+            f.write(f"■ [1] BM25 (Sparse) 검색엔진 수집 단락 (총 {len(bm25_docs)}개)\n")
+            f.write("-" * 70 + "\n")
+            for idx, doc in enumerate(bm25_docs, 1):
+                src = doc.metadata.get("source", "Unknown")
+                p_id = doc.metadata.get("parent_id", "Unknown")
+                f.write(f"[{idx:02d}] 출처: {src} | Parent ID: {p_id}\n")
+                f.write(f"[메타데이터]: {json.dumps(doc.metadata, ensure_ascii=False)}\n")
+                f.write("-" * 40 + "\n")
+                f.write("[원문 본문 내용]\n")
+                f.write(doc.page_content)
+                f.write("\n" + "=" * 50 + "\n\n")
+                
+            f.write(f"■ [2] Vector DB (Dense) 검색엔진 수집 단락 (총 {len(vector_docs)}개)\n")
+            f.write("-" * 70 + "\n")
+            for idx, doc in enumerate(vector_docs, 1):
+                src = doc.metadata.get("source", "Unknown")
+                p_id = doc.metadata.get("parent_id", "Unknown")
+                f.write(f"[{idx:02d}] 출처: {src} | Parent ID: {p_id}\n")
+                f.write(f"[메타데이터]: {json.dumps(doc.metadata, ensure_ascii=False)}\n")
+                f.write("-" * 40 + "\n")
+                f.write("[원문 본문 내용]\n")
+                f.write(doc.page_content)
+                f.write("\n" + "=" * 50 + "\n\n")
+                
+        logger.info(f"[UI Document Backup Success] 원문 백업 파일이 저장되었습니다 -> {filename}")
+    except Exception as backup_err:
+        logger.error(f"[UI Document Backup Failed] 백업 도중 오류 발생: {str(backup_err)}")
+
 def robust_request_post(url, headers, json_data, timeout=60, max_retries=3, initial_delay=2):
-    """
-    Gemini 무료 티어 호출 횟수(5 RPM) 제어 장벽 및 순간 지연을 방어하는 지수 백오프 레이어
-    """
+    """Gemini 무료 티어 호출 횟수(5 RPM) 제어 장벽 및 순간 지연을 방어하는 지수 백오프 레이어"""
     delay = initial_delay
     for attempt in range(1, max_retries + 1):
         try:
             response = requests.post(url, headers=headers, json=json_data, timeout=timeout)
-            
-            # 429(Rate Limit 초과) 발생 시 백오프 대기 후 재시도 방어선 가동
             if response.status_code in [429, 503]:
                 logger.warning(f"[Gemini 속도 제한 감지] HTTP {response.status_code} 발생. {attempt}/{max_retries} 백오프 재시도 진입...")
-                logger.warning(f"[Gemini 속도 제한 감지] {delay}초 대기 후 안전하게 재요청을 송신합니다.")
                 time.sleep(delay)
                 delay *= 2
                 continue
-                
             return response
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
             logger.warning(f"[네트워크 지연] 연결 오류: {str(e)}. {attempt}/{max_retries} 재시도 준비중...")
@@ -78,18 +126,28 @@ def rewrite_query(question: str, chat_history: list, gemini_base: str, headers: 
     if not chat_history:
         return question
         
-    history_str = "\n".join([f"{msg['role'].upper()}: {msg['content']}" for msg in chat_history])
+    history_str = ""
+    for msg in chat_history[-4:]:
+        history_str += f"{msg['role'].upper()}: {msg['content']}\n"
     
     rewrite_prompt = (
-        "당신은 검색 쿼리 최적화 AI입니다. 아래 제공된 [이전 대화 기록]을 바탕으로 "
-        "[현재 질문]에 포함된 대명사('이것', '그거', '저 사람' 등)나 생략된 주어를 명확한 명사로 치환하여, "
-        "단독으로 검색 시스템에 입력해도 맥락을 완벽히 이해할 수 있는 '하나의 명확한 검색 질문'으로 다시 작성해주세요.\n\n"
-        "주의: 질문에 대한 답을 절대 하지 말고, 오직 '재작성된 질문 문장' 딱 하나만 출력하세요.\n\n"
-        f"[이전 대화 기록]\n{history_str}\n\n"
-        f"[현재 질문]: {question}"
+        "당신은 정보 검색 시스템(RAG)의 성능을 극대화하기 위해 사용자의 질의를 최적화하는 검색 쿼리 정제 전문가입니다.\n"
+        "제공된 [이전 대화 기록]을 분석하여 사용자가 생략한 주어나 목적어가 있다면 이를 보완하되, "
+        "절대로 문장형 서술어('~에 대해 알려줘', '찾아줘', '구체적인 안내')나 불필요한 조사, 안내성 수식어를 붙이지 마십시오.\n"
+        "검색엔진의 키워드 매칭 신뢰도를 높이기 위해, 반드시 고유명사와 핵심 명사 위주의 콤팩트한 단어 조합 형태로만 결과를 딱 하나 출력하세요.\n\n"
+        "❌ 나쁜 출력 예시: 박수원 교수님의 연구실 위치와 연락처 정보를 찾아줘\n"
+        "⭕ 좋은 출력 예시: 박수원 교수 연구실 위치 연락처\n\n"
+        "◆ [Few-Shot Examples]\n"
+        "이전 대화 기록:\n"
+        "USER: 컴퓨터공학과 학과사무실 전화번호가 뭐야?\n"
+        "ASSISTANT: 컴퓨터공학과 사무실 번호는 02-940-XXXX 입니다.\n"
+        "현재 질문: 박수원 교수님은?\n"
+        "출력: 박수원 교수\n\n"
+        f"[이전 대화 기록]\n{history_str}\n"
+        f"[현재 질문]: {question}\n\n"
+        "출력:"
     )
     
-    # 250K TPM 한도를 가진 안전한 대형 창구인 gemini-2.5-flash 모델로 고정 우회
     url = f"{gemini_base}/gemini-3.1-flash-lite:generateContent"
     payload = {
         "contents": [{"role": "user", "parts": [{"text": rewrite_prompt}]}],
@@ -107,10 +165,7 @@ def rewrite_query(question: str, chat_history: list, gemini_base: str, headers: 
         return question
 
 def _rag_worker(job_id: str, question: str, model_name: str, chat_history: list):
-    """
-    백그라운드 비동기 RAG 워커 함수 (구글 Gemini API 공식 복구 연동 버젼)
-    """
-    # Google Generative Language API 표준 베이스 엔드포인트 규격 선언
+    """백그라운드 비동기 RAG 워커 함수 (UI 실시간 원문 파일 저장 연동 버전)"""
     GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
     HEADERS = {
         "x-goog-api-key": API_KEY, 
@@ -121,28 +176,36 @@ def _rag_worker(job_id: str, question: str, model_name: str, chat_history: list)
     logger.info(f"=== [Gemini API Worker Start] Job ID: {job_id} ===")
 
     try:
-        # 1. 쿼리 최적화 수행 (Gemini 2.5 Flash 기반 안전 구동)
+        # 1. 쿼리 최적화 수행
         optimized_query = rewrite_query(question, chat_history, GEMINI_BASE, HEADERS)
         logger.info(f"[Query Rewrite 완료] 결과 변환 쿼리: '{optimized_query}'")
 
-        # 2. RAG 지식 검색 가동 (VoyageAI + BM25)
+        # 2. RAG 지식 검색 인스턴스 지연 생성 후 개별 수집 가동
         rag_engine = get_rag_system()
         
+        # [원문 분리 백업을 위해 지연 호출 전 1차 매칭 단계 로깅 연동]
+        bm25_query = rag_engine.extract_keywords_for_bm25(optimized_query)
+        rag_engine.bm25_retriever.k = 20
+        bm25_results = rag_engine.bm25_retriever.invoke(bm25_query)
+        vector_results = rag_engine.vector_db.similarity_search(optimized_query, k=20)
+        
+        # 📌 [핵심 요구사항 반영]: 사용자가 UI에서 할 질문과 수집 문서를 원문 통째로 백업 실행
+        save_ui_retrieved_documents(question, optimized_query, bm25_results, vector_results)
+
+        # 3. 기존의 하이브리드 통합 융합 파이프라인 수행 (Rerank -> Parent Context 복원)
         logger.info(f"[Hybrid Search] 탐색 시작 -> '{optimized_query}'")
         start_time = datetime.now()
-        
-        # Gemini의 250,000 TPM 한도 마진 회복에 맞춰 상위 Parent 복원 단락 개수를 다시 4개로 원상 복귀! (RAG 답변 가버리지 전면 복원)
         context, sources = rag_engine.hybrid_search(optimized_query, top_n=4)
         logger.info(f"[Hybrid Search] 탐색 완료. 소요 시간: {datetime.now() - start_time}")
 
-        # 3. 대화 이력 포장
+        # 4. 대화 이력 포장
         history_str = ""
         if chat_history:
             history_str = "\n".join([f"- {msg['role'].upper()}: {msg['content']}" for msg in chat_history])
         else:
             history_str = "이전 대화 기록이 없음."
 
-        # 4. 메모리와 지식이 융합된 프롬프트 조립
+        # 5. 메모리와 지식이 융합된 최종 프롬프트 조립
         full_prompt = (
             "당신은 광운대학교 학사안내 전문 AI 비서 KlaWde입니다.\n"
             "제공된 [참조 컨텍스트 지식 스토어]의 내용과 이전에 나눈 [이전 대화 메모리 기록]을 함께 참고하여 대화의 맥락에 맞는 답변을 완성하세요.\n"
@@ -152,7 +215,6 @@ def _rag_worker(job_id: str, question: str, model_name: str, chat_history: list)
             f"[사용자 질의 요구사항]: {question}"
         )
         
-        # app.py 단 라디오 버튼 선택에 대응하는 공식 구글 모델 식별자 맵핑
         target_model = "gemini-3.1-flash-lite"
         url = f"{GEMINI_BASE}/{target_model}:generateContent"
         
@@ -161,8 +223,8 @@ def _rag_worker(job_id: str, question: str, model_name: str, chat_history: list)
             "generationConfig": {"temperature": 0.2}
         }
         
-        # 5. 메인 Gemini API 생성 요청 송신
-        logger.info(f"[Gemini LLM] 메인 생성 요청 송신 중 -> 타겟 모델: {target_model}")
+        # 6. 메인 Gemini API 생성 요청 송신
+        logger.info(f" can[Gemini LLM] 메인 생성 요청 송신 중 -> 타겟 모델: {target_model}")
         response = robust_request_post(url, headers=HEADERS, json_data=payload, timeout=60)
         response.raise_for_status()
         answer = response.json()["candidates"][0]["content"]["parts"][0]["text"]
@@ -170,7 +232,7 @@ def _rag_worker(job_id: str, question: str, model_name: str, chat_history: list)
         if sources:
             answer += "\n\n📎 **KlaWde RAG 분석 기반 시스템 참조 출처**\n" + "\n".join(f"- {s}" for s in sources)
 
-        # 6. 임시 결과 영속화 디스크 드랍
+        # 7. 임시 결과 영속화 디스크 드랍 (Streamlit 프론트엔드가 감지하는 규격 엔드포인트)
         with open(job_path, "w", encoding="utf-8") as f:
             json.dump({"done": True, "result": answer}, f, ensure_ascii=False)
         logger.info(f"[File I/O] 결과 파일 드랍 완료.")
