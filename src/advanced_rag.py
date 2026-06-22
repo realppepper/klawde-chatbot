@@ -15,6 +15,9 @@ from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 from kiwipiepy import Kiwi
 
+# ───────────────────────────────────────────
+# 엔진 전용 로깅 시스템 세팅
+# ───────────────────────────────────────────
 logger = logging.getLogger("KlawdeLogger")
 if not logger.handlers:
     logger.setLevel(logging.DEBUG)
@@ -69,12 +72,12 @@ class AdvancedRAGEngine:
                     self.vector_db = Chroma(persist_directory=CHROMA_DIR, embedding_function=self.embeddings)
                     logger.info("[Engine Init] [구간 통과 1] Chroma 데이터베이스 연결 성공.")
                     
-                    logger.info("[Engine Init] [구간 확인 2] 사전 빌드된 BM25 인덱스 역직렬화 시도...")
+                    logger.info("[Engine Init] [구간 확인 2] 사전 빌드된 BM25 인덱스 역직렬화(Pickle Load) 시도...")
                     with open(BM25_PKL_PATH, "rb") as f:
                         self.bm25_retriever = pickle.load(f)
                     
                     self.bm25_retriever.preprocess_func = korean_tokenizer
-                    logger.info("[Engine Init] [구간 통과 2] BM25 사전 빌드 인덱스 적재 완료.")
+                    logger.info("[Engine Init] [구간 통과 2] BM25 사전 빌드 인덱스 적재 완료 (CPU 병목 원천 차단).")
                 else:
                     logger.warning("[Engine Init] 인덱싱 데이터 파일 세트가 유실되었습니다. 선행 빌드가 요구됩니다.")
                     
@@ -141,48 +144,44 @@ class AdvancedRAGEngine:
                         db.add_documents(batch)
             
             os.makedirs(CHROMA_DIR, exist_ok=True)
-            logger.info("[Engine Build] 사전 빌드용 BM25Retriever 형태소 토크나이징 시작...")
+            
+            logger.info("[Engine Build] 사전 빌드용 BM25Retriever 형태소 토크나이징 시작 (수 분 소요 예정)...")
             bm25_retriever = BM25Retriever.from_documents(all_child_chunks, preprocess_func=korean_tokenizer)
+            
             bm25_retriever.preprocess_func = None 
             
             with open(BM25_PKL_PATH, "wb") as f:
                 pickle.dump(bm25_retriever, f)
+                
             logger.info(f"[Engine Build] 백업 파일 최종 드랍 성공: {BM25_PKL_PATH}")
         except Exception as e:
             logger.error(f"[Engine Build 에러] {str(e)}\n{traceback.format_exc()}")
             raise e
 
-    def hybrid_search(self, original_query, hyde_doc=None, hyqe_query=None, top_n=4):
-        """HyDE 가상 본문문서와 HyQE 최적화 키워드 질문을 듀얼 채널로 투입하여 1차 문맥을 수집하는 핵심 메서드"""
-        hyde_doc = hyde_doc or original_query
-        hyqe_query = hyqe_query or original_query
-        
-        logger.info(f"[Engine Search] HyDE/HyQE 하이브리드 지식 결합 탐색 알고리즘 구동")
+    def hybrid_search(self, query, top_n=4):
+        logger.info(f"[Engine Search] 런타임 하이브리드 서치 기동 -> 쿼리: '{query}'")
         if not self.vector_db or not self.bm25_retriever:
-            return "엔진 저장소 연결 상태가 비정상입니다.", []
+            return "엔진 상태가 비정상입니다.", []
 
         try:
             self.bm25_retriever.k = 20
-            
-            # [Track 1] Dense Channel: 가상의 답변 본문(HyDE)을 주입하여 유사 의미 탐색
-            vector_results = self.vector_db.similarity_search(hyde_doc, k=20)
-            
-            # [Track 2] Sparse Channel: 복원 완료된 키워드성 질문(HyQE)을 타고 단어 매칭 수행
-            bm25_results = self.bm25_retriever.invoke(hyqe_query)
+            vector_results = self.vector_db.similarity_search(query, k=20)
+            bm25_results = self.bm25_retriever.invoke(query)
 
             unique_chunks_dict = {c.metadata.get("parent_id", "none") + "_" + c.page_content: c for c in (vector_results + bm25_results)}
             unique_chunks = list(unique_chunks_dict.values())
             documents_texts = [c.page_content for c in unique_chunks]
 
+            # [핵심 교정] 지원되지 않는 'voyage-rerank-2' 모델명을 공식 규격인 'rerank-2'로 변경
             try:
-                # [Track 3] Cross-Attention Reranking: 리랭킹 적합도 판단은 사용자가 직접 질문한 '실제 질문'을 기반으로 대조
                 rerank_results = self.voyage_client.rerank(
-                    query=original_query, 
+                    query=query, 
                     documents=documents_texts, 
                     model="rerank-2", 
                     top_k=min(top_n * 3, len(documents_texts))
                 )
                 
+                # 정상 정렬된 인덱스 바인딩 순회
                 fused_parent_contexts = []
                 retrieved_sources = set()
                 seen_parent_ids = set()
@@ -196,7 +195,8 @@ class AdvancedRAGEngine:
                     if len(fused_parent_contexts) >= top_n: break
                     
             except Exception as rerank_err:
-                logger.error(f"[Rerank API Warning] 리랭킹 연산 실패 (1차 풀백 가동): {str(rerank_err)}")
+                # [안전 장치] Voyage API 호출간 한도 초과나 기타 네트워크 에러 발생 시, 검색이 통째로 폭파되지 않고 1차 검색 랭킹순으로 안정적으로 폴백되도록 보호
+                logger.error(f"[Rerank API Warning] 리랭킹 연산 실패 (1차 매칭 순으로 폴백 수행): {str(rerank_err)}")
                 fused_parent_contexts = []
                 retrieved_sources = set()
                 seen_parent_ids = set()
